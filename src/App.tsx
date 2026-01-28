@@ -11,6 +11,7 @@ interface Status {
   history: Array<{ marketId: string; result: "win" | "loss"; betAmount: number; side: "UP" | "DOWN"; timestamp: string }>;
   trackedMarketsCount: number;
   tradingSide: "UP" | "DOWN";
+  consecutiveCandlesCount: number;
 }
 
 interface Config {
@@ -20,6 +21,7 @@ interface Config {
   signatureType: number;
   funderAddress: string;
   tradingSide: "UP" | "DOWN";
+  consecutiveCandlesCount: number;
 }
 
 const API_BASE = 'http://localhost:3000/api';
@@ -31,9 +33,8 @@ function App() {
     privateKey: '',
     investmentAmount: '',
     checkInterval: '',
-    signatureType: '1',
     funderAddress: '',
-    tradingSide: 'UP' as "UP" | "DOWN",
+    consecutiveCandlesCount: '5',
   });
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
@@ -74,9 +75,8 @@ function App() {
           privateKey: prev.privateKey || '', // Private key is never pre-filled for security
           investmentAmount: isFirstLoad ? (data.investmentAmount?.toString() || '') : prev.investmentAmount,
           checkInterval: isFirstLoad ? (data.checkInterval?.toString() || '') : prev.checkInterval,
-          signatureType: isFirstLoad ? (data.signatureType?.toString() || '1') : prev.signatureType,
           funderAddress: isFirstLoad ? (data.funderAddress || '') : prev.funderAddress,
-          tradingSide: isFirstLoad ? (data.tradingSide || 'UP') : prev.tradingSide,
+          consecutiveCandlesCount: isFirstLoad ? (data.consecutiveCandlesCount?.toString() || '5') : prev.consecutiveCandlesCount,
         };
       });
     } catch (error) {
@@ -87,7 +87,7 @@ function App() {
   useEffect(() => {
     fetchStatus();
     fetchConfig();
-    const interval = setInterval(fetchStatus, 2000); // Poll every 2 seconds
+    const interval = setInterval(fetchStatus, 10000); // Poll every 2 seconds
     return () => clearInterval(interval);
   }, []);
 
@@ -114,40 +114,16 @@ function App() {
     setValidationErrors([]);
     
     try {
-      // Update config first
-      const configRes = await fetch(`${API_BASE}/config`, {
+      // Start bot
+      const res = await fetch(`${API_BASE}/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           privateKey: configForm.privateKey || undefined,
           investmentAmount: configForm.investmentAmount ? parseFloat(configForm.investmentAmount) : undefined,
           checkInterval: configForm.checkInterval ? parseInt(configForm.checkInterval) : undefined,
-          signatureType: configForm.signatureType ? parseInt(configForm.signatureType) : undefined,
           funderAddress: configForm.funderAddress || undefined,
-          tradingSide: configForm.tradingSide,
-        }),
-      });
-      
-      const configData = await configRes.json();
-      if (configData.error) {
-        setMessage({ type: 'error', text: configData.error });
-        setLoading(false);
-        return;
-      }
-      
-      // Validate before starting
-      if (!validateConfig()) {
-        setMessage({ type: 'error', text: 'Please fix validation errors before starting' });
-        setLoading(false);
-        return;
-      }
-      
-      // Start bot
-      const res = await fetch(`${API_BASE}/start`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          tradingSide: configForm.tradingSide,
+          consecutiveCandlesCount: configForm.consecutiveCandlesCount ? parseInt(configForm.consecutiveCandlesCount) : undefined,
         }),
       });
       const data = await res.json();
@@ -177,43 +153,6 @@ function App() {
       }
     } catch (error) {
       setMessage({ type: 'error', text: 'Failed to stop bot' });
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleConfigUpdate = async (e: React.FormEvent) => {
-    e.preventDefault();
-    
-    // Prevent config update while bot is running
-    if (status?.running) {
-      setMessage({ type: 'error', text: 'Cannot update config while bot is running. Please stop the bot first.' });
-      return;
-    }
-    
-    setLoading(true);
-    try {
-      const res = await fetch(`${API_BASE}/config`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          privateKey: configForm.privateKey || undefined,
-          investmentAmount: configForm.investmentAmount ? parseFloat(configForm.investmentAmount) : undefined,
-          checkInterval: configForm.checkInterval ? parseInt(configForm.checkInterval) : undefined,
-          signatureType: configForm.signatureType ? parseInt(configForm.signatureType) : undefined,
-          funderAddress: configForm.funderAddress || undefined,
-          tradingSide: configForm.tradingSide,
-        }),
-      });
-      const data = await res.json();
-      if (data.error) {
-        setMessage({ type: 'error', text: data.error });
-      } else {
-        setMessage({ type: 'success', text: 'Config updated successfully' });
-        fetchConfig();
-      }
-    } catch (error) {
-      setMessage({ type: 'error', text: 'Failed to update config' });
     } finally {
       setLoading(false);
     }
@@ -293,14 +232,9 @@ function App() {
                 <span className="text-gray-600">Tracked Markets:</span>
                 <span className="text-lg font-semibold">{status?.trackedMarketsCount || 0}</span>
               </div>
-
               <div className="flex items-center justify-between">
-                <span className="text-gray-600">Trading Side:</span>
-                <span className={`px-3 py-1 rounded-full text-sm font-medium ${
-                  status?.tradingSide === 'UP' ? 'bg-blue-100 text-blue-800' : 'bg-purple-100 text-purple-800'
-                }`}>
-                  {status?.tradingSide || 'UP'}
-                </span>
+                <span className="text-gray-600">Consecutive Candles:</span>
+                <span className="text-lg font-semibold">{status?.consecutiveCandlesCount || 5}</span>
               </div>
 
               <div className="pt-4 border-t">
@@ -330,7 +264,7 @@ function App() {
               </div>
             )}
             
-            <form onSubmit={handleConfigUpdate} className="space-y-4">
+            <div className="space-y-4">
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">
                   Private Key <span className="text-red-500">*</span>
@@ -393,24 +327,6 @@ function App() {
 
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Signature Type
-                </label>
-                <select
-                  value={configForm.signatureType}
-                  onChange={(e) => setConfigForm({ ...configForm, signatureType: e.target.value })}
-                  disabled={status?.running}
-                  className={`w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent ${
-                    status?.running ? 'bg-gray-100 cursor-not-allowed' : ''
-                  }`}
-                >
-                  <option value="0">0 - EOA (MetaMask)</option>
-                  <option value="1">1 - Email/Magic wallet</option>
-                  <option value="2">2 - Browser wallet proxy</option>
-                </select>
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">
                   Funder Address
                 </label>
                 <input
@@ -427,53 +343,29 @@ function App() {
 
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Trading Side
+                  Consecutive Candles Count
                 </label>
-                <div className="flex items-center space-x-4">
-                  <button
-                    type="button"
-                    onClick={() => !status?.running && setConfigForm({ ...configForm, tradingSide: 'UP' })}
-                    disabled={status?.running}
-                    className={`flex-1 py-2 px-4 rounded-lg font-semibold transition-colors ${
-                      configForm.tradingSide === 'UP'
-                        ? 'bg-blue-500 text-white'
-                        : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
-                    } ${status?.running ? 'opacity-50 cursor-not-allowed' : ''}`}
-                  >
-                    UP
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => !status?.running && setConfigForm({ ...configForm, tradingSide: 'DOWN' })}
-                    disabled={status?.running}
-                    className={`flex-1 py-2 px-4 rounded-lg font-semibold transition-colors ${
-                      configForm.tradingSide === 'DOWN'
-                        ? 'bg-purple-500 text-white'
-                        : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
-                    } ${status?.running ? 'opacity-50 cursor-not-allowed' : ''}`}
-                  >
-                    DOWN
-                  </button>
-                </div>
-                <p className="mt-2 text-sm text-gray-500">
-                  {configForm.tradingSide === 'UP' 
-                    ? 'Will buy UP tickets when UP price < 50¢'
-                    : 'Will buy DOWN tickets when DOWN price < 50¢'}
+                <input
+                  type="number"
+                  min="1"
+                  max="20"
+                  value={configForm.consecutiveCandlesCount}
+                  onChange={(e) => {
+                    setConfigForm({ ...configForm, consecutiveCandlesCount: e.target.value });
+                    setValidationErrors([]);
+                  }}
+                  placeholder={config?.consecutiveCandlesCount?.toString() || '5'}
+                  disabled={status?.running}
+                  className={`w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent ${
+                    validationErrors.some(e => e.includes('Consecutive Candles')) ? 'border-red-500' : 'border-gray-300'
+                  } ${status?.running ? 'bg-gray-100 cursor-not-allowed' : ''}`}
+                />
+                <p className="mt-1 text-sm text-gray-500">
+                  Number of consecutive same-color candles required before placing order (1-20)
                 </p>
               </div>
 
-              <button
-                type="submit"
-                disabled={loading || status?.running}
-                className={`w-full py-2 px-4 rounded-lg font-semibold ${
-                  status?.running
-                    ? 'bg-gray-400 text-gray-200 cursor-not-allowed'
-                    : 'bg-blue-500 hover:bg-blue-600 text-white'
-                } disabled:opacity-50`}
-              >
-                {status?.running ? 'Bot Running - Config Disabled' : loading ? 'Updating...' : 'Update Config'}
-              </button>
-            </form>
+            </div>
           </div>
         </div>
 

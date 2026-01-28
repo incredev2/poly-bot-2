@@ -19,6 +19,14 @@ export interface Config {
     bot: BotConfig;
 }
 
+export interface StartConfig {
+    privateKey: string;
+    investmentAmount: number;
+    checkInterval: number;
+    funderAddress: string;
+    consecutiveCandlesCount: number;
+}
+
 export const config: Config = {
     api: {
         privateKey: process.env.PRIVATE_KEY || '',

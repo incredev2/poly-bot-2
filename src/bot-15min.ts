@@ -31,19 +31,28 @@ export class PolymarketBot15Min {
     protected processedMarkets: Set<string>;
     protected trackedMarkets: Map<string, { conditionId: string; side: "UP" | "DOWN" }>;
     protected tradingSide: "UP" | "DOWN" = "UP";
+    protected waitingFor5Consecutive: boolean = false;
+    protected consecutiveCandlesCount: number = 5;
 
-    constructor() {
+    constructor(options?: {
+        privateKey?: string;
+        checkInterval?: number;
+        initialAmount?: number;
+        funderAddress?: string;
+        consecutiveCandlesCount?: number;
+    }) {
         const errors = validateConfig();
         if (errors.length) {
             console.warn("⚠️ Configuration warnings:");
             errors.forEach((e) => console.warn(`   - ${e}`));
         }
 
-        this.privateKey = config.api.privateKey;
-        this.checkInterval = config.bot.checkInterval;
-        this.initialAmount = config.bot.investmentAmount;
-        this.currentBetAmount = config.bot.investmentAmount;
-        this.investmentAmount = config.bot.investmentAmount;
+        // Use provided options or fall back to config/env values
+        this.privateKey = options?.privateKey || config.api.privateKey;
+        this.checkInterval = options?.checkInterval ?? config.bot.checkInterval;
+        this.initialAmount = options?.initialAmount ?? config.bot.investmentAmount;
+        this.currentBetAmount = this.initialAmount;
+        this.investmentAmount = this.initialAmount;
         
         // Safety: Reset if current bet amount is unreasonably high (likely from previous run)
         if (this.currentBetAmount > this.initialAmount * 100) {
@@ -52,7 +61,8 @@ export class PolymarketBot15Min {
         }
         
         this.signatureType = parseInt(process.env.SIGNATURE_TYPE || "1");
-        this.funderAddress = process.env.FUNDER_ADDRESS;
+        this.funderAddress = options?.funderAddress || process.env.FUNDER_ADDRESS;
+        this.consecutiveCandlesCount = options?.consecutiveCandlesCount ?? parseInt(process.env.CONSECUTIVE_CANDLES_COUNT || "5", 10);
         this.orderLock = false;
         this.processedMarkets = new Set();
         this.trackedMarkets = new Map();
@@ -141,38 +151,56 @@ export class PolymarketBot15Min {
         return `btc-updown-15m-${timestamp}`;
     }
 
-    async findBTC15MinMarkets(): Promise<PolymarketMarket[]> {
-        // Generate slugs for current and next few windows
-        const slugs: string[] = [];
-        for (let i = 0; i < 4; i++) {
-            slugs.push(this.generate15MinSlug(i));
-        }
+    async findBTC15MinMarkets(): Promise<{ current: PolymarketMarket | null; next: PolymarketMarket | null }> {
+        const currentSlug = this.generate15MinSlug(0);
+        const nextSlug = this.generate15MinSlug(1);
         
-        console.log(`🔍 Checking: ${slugs[0]}, ${slugs[1]}...`);
+        console.log(`🔍 Checking current: ${currentSlug}, next: ${nextSlug}...`);
 
-        // Method 2: Try slug as query param
-        for (const slug of slugs) {
-            try {
-                const res = await this.http.get(`${config.api.gammaUrl}/events`, {
-                    params: { slug }
-                });
-                if (res.status === 200 && res.data) {
-                    const events = Array.isArray(res.data) ? res.data : [res.data];
-                    for (const event of events) {
-                        const markets = event.markets || [event];
-                        const active = markets.filter((m: PolymarketMarket) => !m.closed);
-                        if (active.length > 0) {
-                            console.log(`   ✅ Found via ?slug=${slug}`);
-                            return active;
-                        }
+        let currentMarket: PolymarketMarket | null = null;
+        let nextMarket: PolymarketMarket | null = null;
+
+        // Fetch current market
+        try {
+            const currentRes = await this.http.get(`${config.api.gammaUrl}/events`, {
+                params: { slug: currentSlug }
+            });
+            if (currentRes.status === 200 && currentRes.data) {
+                const events = Array.isArray(currentRes.data) ? currentRes.data : [currentRes.data];
+                for (const event of events) {
+                    const markets = event.markets || [event];
+                    const active = markets.filter((m: PolymarketMarket) => !m.closed);
+                    if (active.length > 0) {
+                        currentMarket = active[0];
+                        break;
                     }
                 }
-            } catch (e) {
-                // Try next method
             }
+        } catch (e) {
+            console.log(`⚠️ Failed to fetch current market: ${e}`);
         }
-       
-        return [];
+
+        // Fetch next market
+        try {
+            const nextRes = await this.http.get(`${config.api.gammaUrl}/events`, {
+                params: { slug: nextSlug }
+            });
+            if (nextRes.status === 200 && nextRes.data) {
+                const events = Array.isArray(nextRes.data) ? nextRes.data : [nextRes.data];
+                for (const event of events) {
+                    const markets = event.markets || [event];
+                    const active = markets.filter((m: PolymarketMarket) => !m.closed);
+                    if (active.length > 0) {
+                        nextMarket = active[0];
+                        break;
+                    }
+                }
+            }
+        } catch (e) {
+            console.log(`⚠️ Failed to fetch next market: ${e}`);
+        }
+
+        return { current: currentMarket, next: nextMarket };
     }
 
     async getTicketPrices(market: PolymarketMarket): Promise<TicketPrices | null> {
@@ -287,15 +315,77 @@ export class PolymarketBot15Min {
             return false;
         }
     }
+    
+    async getLastNCandles(
+        count: number = this.consecutiveCandlesCount
+        ): Promise<Array<{ time: string; low: number; high: number; open: number; close: number; volume: number }> | null> {
+        const BINANCE_URL = "https://api.binance.com/api/v3/klines";
+        const SYMBOL = "BTCUSDT";
+        const INTERVAL = "15m";
+
+        try {
+            const url = `${BINANCE_URL}?symbol=${SYMBOL}&interval=${INTERVAL}&limit=${count}`;
+            const res = await this.http.get<any[]>(url);
+            const data = res.data;
+
+            // Binance kline format:
+            // [
+            //   0 open time,
+            //   1 open,
+            //   2 high,
+            //   3 low,
+            //   4 close,
+            //   5 volume,
+            //   6 close time,
+            //   ...
+            // ]
+
+            const candles = data.map((kline: any[]) => ({
+            time: new Date(kline[0]).toISOString(),
+            open: parseFloat(kline[1]),
+            high: parseFloat(kline[2]),
+            low: parseFloat(kline[3]),
+            close: parseFloat(kline[4]),
+            volume: parseFloat(kline[5]),
+            }));
+
+            console.log(`📊 Last ${count} candles:`, candles);
+            return candles;
+        } catch (e) {
+            const errorMsg = e instanceof Error ? e.message : String(e);
+            console.log(`⚠️ Error fetching candles: ${errorMsg}`);
+            return null;
+        }
+    }
+
+    setConsecutiveCandlesCount(count: number): void {
+        if (count < 1 || count > 20) {
+            console.warn(`⚠️ Invalid consecutive candles count: ${count}. Must be between 1 and 20. Keeping current: ${this.consecutiveCandlesCount}`);
+            return;
+        }
+        this.consecutiveCandlesCount = count;
+        console.log(`✅ Consecutive candles count set to: ${count}`);
+    }
 
     async checkMarketResults(): Promise<void> {
-        // Check tracked markets to see if they've closed and determine win/loss
+        if (!this.client) return;
+        console.log("2222222222222222222222222", {
+            privateKey: this.privateKey,
+            checkInterval: this.checkInterval,
+            investmentAmount: this.investmentAmount,
+            initialAmount: this.initialAmount,
+            currentBetAmount: this.currentBetAmount,
+            funderAddress: this.funderAddress,
+            consecutiveCandlesCount: this.consecutiveCandlesCount,
+            tradedMarkets: this.trackedMarkets
+        })
+
+        // Step 1: Check tracked markets to see if they've closed and determine win/loss
         for (const [marketKey, marketInfo] of this.trackedMarkets.entries()) {
             try {
-                if (!this.client) continue;
-
                 // Get market details to check end time
-                const markets = await this.findBTC15MinMarkets();
+                const { current, next } = await this.findBTC15MinMarkets();
+                const markets = [current, next].filter(m => m !== null) as PolymarketMarket[];
                 const marketDetails = markets.find(m => {
                     const details = m.markets?.[0] || m;
                     return details.conditionId === marketInfo.conditionId;
@@ -317,14 +407,14 @@ export class PolymarketBot15Min {
                 const timeLeftSeconds = (end.getTime() - Date.now()) / 1000;
                 
                 // Only check if market has ended (time left <= 1 second)
-                if (timeLeftSeconds > 1) {
+                if (timeLeftSeconds > 5) {
                     continue;
                 }
                 
                 // Remove from tracked markets IMMEDIATELY to prevent double processing
                 this.trackedMarkets.delete(marketKey);
                 
-                // Market has ended, get current UP price to determine win/loss
+                // Market has ended, get current prices to determine win/loss
                 const prices = await this.getTicketPrices(details);
                 if (!prices) {
                     console.log(`⚠️ Could not get prices for market ${marketInfo.conditionId.slice(0, 8)}`);
@@ -352,38 +442,149 @@ export class PolymarketBot15Min {
                 console.log(`   We bet: ${marketInfo.side}, Result: ${weWon ? "WIN" : "LOSS"}`);
                 console.log(`   Current bet amount before update: $${this.currentBetAmount}`);
 
-                // Update bet amount based on result
+                // Step 2: Update bet amount based on result
                 if (weWon) {
-                    // Win: reset to initial amount (NEVER change trading side on win)
+                    // Win: reset to initial amount and wait for N consecutive candles
                     this.currentBetAmount = this.initialAmount;
-                    console.log(`✅ Win! Next bet: $${this.currentBetAmount} (reset to initial), trading side remains: ${this.tradingSide}`);
+                    this.investmentAmount = this.initialAmount;
+                    this.waitingFor5Consecutive = true;
+                    console.log(`✅ Win! Reset bet to $${this.currentBetAmount} (initial). Waiting for ${this.consecutiveCandlesCount} consecutive same-color candles before next bet.`);
                 } else {
-                    // Loss: double the current bet amount (exactly 2x, not 4x)
+                    // Loss: double the current bet amount (2x)
                     const previousBet = this.currentBetAmount;
-                    
-                    // Safety mechanism: If we've lost 4 times in a row (bet = 16 * initial),
-                    // on the 5th loss, reset to initial and flip trading side
-                    const expectedFifthLossBet = 16 * this.initialAmount;
-                    const isFifthConsecutiveLoss = Math.abs(previousBet - expectedFifthLossBet) < 0.01; // Use tolerance for floating point comparison
-                    
-                    console.log(`🔍 Loss check: previousBet=$${previousBet}, initialAmount=$${this.initialAmount}, expectedFifthLossBet=$${expectedFifthLossBet}, isFifthConsecutiveLoss=${isFifthConsecutiveLoss}`);
-                    
-                    if (isFifthConsecutiveLoss) {
-                        // 5th consecutive loss: Reset bet and flip trading side
-                        const oldSide = this.tradingSide;
-                        this.currentBetAmount = this.initialAmount;
-                        this.tradingSide = this.tradingSide === "UP" ? "DOWN" : "UP";
-                        console.log(`🔄 5th consecutive loss detected! Resetting bet to $${this.currentBetAmount} and switching trading side from ${oldSide} to ${this.tradingSide}`);
-                    } else {
-                        // Normal loss: double the bet (NEVER change trading side on normal loss)
-                        this.currentBetAmount = 2 * this.currentBetAmount;
-                        console.log(`❌ Loss! Previous bet: $${previousBet}, Next bet: $${this.currentBetAmount} (doubled to 2x), trading side remains: ${this.tradingSide}`);
-                    }
+                    this.currentBetAmount = 2 * this.currentBetAmount;
+                    this.investmentAmount = this.currentBetAmount;
+                    console.log(`❌ Loss! Previous bet: $${previousBet}, Next bet: $${this.currentBetAmount} (doubled to 2x)`);
                 }
             } catch (e) {
                 const errorMsg = e instanceof Error ? e.message : String(e);
                 console.log(`⚠️ Error checking market ${marketInfo.conditionId.slice(0, 8)}: ${errorMsg}`);
             }
+        }
+
+        // Step 3: Check for N consecutive same-color candles and place order to opposite color
+        try {
+            const candles = await this.getLastNCandles(this.consecutiveCandlesCount);
+            if (!candles || candles.length !== this.consecutiveCandlesCount) {
+                return;
+            }
+
+            // Determine color of each candle: green/UP if close > open, red/DOWN if close < open
+            const candleColors = candles.map(candle => candle.close > candle.open ? "UP" : "DOWN");
+            console.log(44444444444444, candleColors)
+            const allSameColor = candleColors.every(color => color === candleColors[0]);
+            
+            if (allSameColor) {
+                const dominantColor = candleColors[0];
+                const oppositeColor = dominantColor === "UP" ? "DOWN" : "UP";
+                
+                // If we're waiting for N consecutive candles after a win, clear the flag
+                if (this.waitingFor5Consecutive) {
+                    this.waitingFor5Consecutive = false;
+                    console.log(`✅ ${this.consecutiveCandlesCount} consecutive ${dominantColor} candles detected after win. Ready to place next bet.`);
+                }
+
+                // Place order to opposite color (we only get here if we have N consecutive candles)
+                // If we were waiting, we've now cleared the flag, so proceed with order
+                console.log(`🔄 All ${this.consecutiveCandlesCount} candles are ${dominantColor}, placing order to ${oppositeColor}`);
+                
+                // Find available market (prefer current, fallback to next)
+                const { current, next } = await this.findBTC15MinMarkets();
+                const market = current || next;
+                console.log({current, next})
+                if (!market) {
+                    console.log(`⏳ No 15-min markets found for placing order`);
+                    return;
+                }
+
+                console.log(`📊 Using ${current ? 'current' : 'next'} market:`, JSON.stringify(market));
+                const details = market.markets?.[0] || market;
+                const conditionId = current?.conditionId;
+
+                if (!conditionId) {
+                    console.log(`⚠️ No conditionId found for market`);
+                    return;
+                }
+
+                // Skip if we already have an order in this market
+                if (this.trackedMarkets.has(conditionId)) {
+                    console.log(`⏸️ Already have order in market ${conditionId.slice(0, 8)}...`);
+                    return;
+                }
+
+                const hasExistingOrder = await this.hasOpenOrderForMarket(conditionId);
+                if (hasExistingOrder) {
+                    console.log(`⏸️ Already have open order in market ${conditionId.slice(0, 8)}...`);
+                    return;
+                }
+
+                // Get prices
+                const prices = await this.getTicketPrices(next!);
+                if (!prices) {
+                    console.log(`⚠️ Could not get prices for market ${conditionId.slice(0, 8)}`);
+                    return;
+                }
+
+                // Determine token and price based on opposite color
+                let tokenId: string;
+                let bidPrice: number;
+                let side: "UP" | "DOWN" = oppositeColor;
+
+                if (oppositeColor === "UP") {
+                    tokenId = prices.upTokenId;
+                    bidPrice = prices.up;
+                } else {
+                    tokenId = prices.downTokenId;
+                    bidPrice = prices.down;
+                }
+
+                // Acquire lock before placing order
+                if (this.orderLock) {
+                    console.log(`⏸️ Order lock active, skipping`);
+                    return;
+                }
+
+                this.orderLock = true;
+                try {
+                    // Final check for existing orders
+                    if (this.trackedMarkets.has(conditionId)) {
+                        console.log(`⏸️ Market ${conditionId.slice(0, 8)} already tracked, skipping`);
+                        return;
+                    }
+
+                    const hasExistingOrderNow = await this.hasOpenOrderForMarket(conditionId);
+                    if (hasExistingOrderNow) {
+                        console.log(`⏸️ Order already exists in market ${conditionId.slice(0, 8)}...`);
+                        return;
+                    }
+
+                    // Mark market as tracked
+                    this.trackedMarkets.set(conditionId, {
+                        conditionId,
+                        side
+                    });
+
+                    // Place order with current bet amount
+                    console.log(`💰 Placing ${side} order with bet amount: $${this.currentBetAmount}`);
+                    const orderResult = await this.placeOrder(next?.conditionId!, tokenId, bidPrice, side);
+
+                    if (!orderResult?.orderID) {
+                        this.trackedMarkets.delete(conditionId);
+                        console.log(`⚠️ Order failed, removed from tracking`);
+                    } else {
+                        console.log(`✅ Order placed successfully: ${side} at ${(bidPrice * 100).toFixed(1)}¢ with $${this.currentBetAmount}`);
+                    }
+                } finally {
+                    this.orderLock = false;
+                }
+            } else {
+                if (this.waitingFor5Consecutive) {
+                    console.log(`⏳ Waiting for ${this.consecutiveCandlesCount} consecutive same-color candles. Current candles are mixed.`);
+                }
+            }
+        } catch (e) {
+            const errorMsg = e instanceof Error ? e.message : String(e);
+            console.log(`⚠️ Error checking candles: ${errorMsg}`);
         }
     }
 
@@ -518,15 +719,15 @@ export class PolymarketBot15Min {
             await this.checkMarketResults();
             
             // Clear processed markets at the start of each tick
-            this.processedMarkets.clear();
+            // this.processedMarkets.clear();
             
-            const markets = await this.findBTC15MinMarkets();
-            if (markets.length === 0) {
-                console.log(`⏳ No 15-min markets found`);
-            } else {
-                console.log(`📊 Found ${markets.length} market(s)`);
-            }
-            await Promise.allSettled(markets.map((m) => this.checkMarket(m)));
+            // const markets = await this.findBTC15MinMarkets();
+            // if (markets.length === 0) {
+            //     console.log(`⏳ No 15-min markets found`);
+            // } else {
+            //     console.log(`📊 Found ${markets.length} market(s)`);
+            // }
+            // await Promise.allSettled(markets.map((m) => this.checkMarket(m)));
         } catch (err) {
             const errorMessage = err instanceof Error ? err.message : "Unknown error";
             console.error("Tick error:", errorMessage);
@@ -543,9 +744,6 @@ export class PolymarketBot15Min {
         console.log("-".repeat(50));
 
         await this.initialize();
-        
-        // Log trading side one more time after initialization to verify it's still set
-        console.log(`📊 Trading side after initialization: ${this.tradingSide}`);
 
         this.tick();
         this.interval = setInterval(() => this.tick(), this.checkInterval);
