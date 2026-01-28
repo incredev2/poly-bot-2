@@ -203,6 +203,35 @@ export class PolymarketBot15Min {
         return { current: currentMarket, next: nextMarket };
     }
 
+    async findMarketByConditionId(conditionId: string): Promise<PolymarketMarket | null> {
+        // Check current, next, and previous windows (to find closed markets)
+        for (let offset = -1; offset <= 1; offset++) {
+            try {
+                const slug = this.generate15MinSlug(offset);
+                const res = await this.http.get(`${config.api.gammaUrl}/events`, {
+                    params: { slug }
+                });
+                if (res.status === 200 && res.data) {
+                    const events = Array.isArray(res.data) ? res.data : [res.data];
+                    for (const event of events) {
+                        const markets = event.markets || [event];
+                        // Include closed markets when searching by conditionId
+                        const found = markets.find((m: PolymarketMarket) => {
+                            const details = m.markets?.[0] || m;
+                            return details.conditionId === conditionId || m.conditionId === conditionId;
+                        });
+                        if (found) {
+                            return found;
+                        }
+                    }
+                }
+            } catch (e) {
+                // Continue to next offset
+            }
+        }
+        return null;
+    }
+
     async getTicketPrices(market: PolymarketMarket): Promise<TicketPrices | null> {
         if (!market.clobTokenIds) return null;
 
@@ -383,15 +412,11 @@ export class PolymarketBot15Min {
         // Step 1: Check tracked markets to see if they've closed and determine win/loss
         for (const [marketKey, marketInfo] of this.trackedMarkets.entries()) {
             try {
-                // Get market details to check end time
-                const { current, next } = await this.findBTC15MinMarkets();
-                const markets = [current, next].filter(m => m !== null) as PolymarketMarket[];
-                const marketDetails = markets.find(m => {
-                    const details = m.markets?.[0] || m;
-                    return details.conditionId === marketInfo.conditionId;
-                });
+                // Find market by conditionId (including closed markets)
+                const marketDetails = await this.findMarketByConditionId(marketInfo.conditionId);
 
                 if (!marketDetails) {
+                    console.log(`⚠️ Could not find market ${marketInfo.conditionId.slice(0, 8)} (may have expired)`);
                     continue;
                 }
 
@@ -406,10 +431,15 @@ export class PolymarketBot15Min {
                 const end = new Date(endDate);
                 const timeLeftSeconds = (end.getTime() - Date.now()) / 1000;
                 
-                // Only check if market has ended (time left <= 1 second)
-                if (timeLeftSeconds > 1) {
+                // Check if market has ended: either closed or time left <= 1 second
+                const isClosed = details.closed || marketDetails.closed;
+                const hasEnded = isClosed || timeLeftSeconds <= 1;
+                
+                if (!hasEnded) {
                     continue;
                 }
+                
+                console.log(`⏰ Market ${marketInfo.conditionId.slice(0, 8)} has ended. Closed: ${isClosed}, Time left: ${timeLeftSeconds.toFixed(1)}s`);
                 
                 // Remove from tracked markets IMMEDIATELY to prevent double processing
                 this.trackedMarkets.delete(marketKey);
@@ -440,21 +470,25 @@ export class PolymarketBot15Min {
                 console.log(`   Time left: ${timeLeftSeconds.toFixed(1)} seconds`);
                 console.log(`   UP price: ${upCents.toFixed(2)}¢ | DOWN price: ${downCents.toFixed(2)}¢`);
                 console.log(`   We bet: ${marketInfo.side}, Result: ${weWon ? "WIN" : "LOSS"}`);
-                console.log(`   Current bet amount before update: $${this.currentBetAmount}`);
+                console.log(`   Current bet amount BEFORE update: $${this.currentBetAmount.toFixed(2)}`);
+                console.log(`   Initial amount: $${this.initialAmount.toFixed(2)}`);
 
                 // Step 2: Update bet amount based on result
                 if (weWon) {
                     // Win: reset to initial amount and wait for N consecutive candles
+                    const previousBet = this.currentBetAmount;
                     this.currentBetAmount = this.initialAmount;
                     this.investmentAmount = this.initialAmount;
                     this.waitingFor5Consecutive = true;
-                    console.log(`✅ Win! Reset bet to $${this.currentBetAmount} (initial). Waiting for ${this.consecutiveCandlesCount} consecutive same-color candles before next bet.`);
+                    console.log(`✅ WIN! Bet amount changed: $${previousBet.toFixed(2)} → $${this.currentBetAmount.toFixed(2)} (reset to initial)`);
+                    console.log(`   Waiting for ${this.consecutiveCandlesCount} consecutive same-color candles before next bet.`);
                 } else {
                     // Loss: double the current bet amount (2x)
                     const previousBet = this.currentBetAmount;
                     this.currentBetAmount = 2 * this.currentBetAmount;
                     this.investmentAmount = this.currentBetAmount;
-                    console.log(`❌ Loss! Previous bet: $${previousBet}, Next bet: $${this.currentBetAmount} (doubled to 2x)`);
+                    console.log(`❌ LOSS! Bet amount changed: $${previousBet.toFixed(2)} → $${this.currentBetAmount.toFixed(2)} (doubled to 2x)`);
+                    console.log(`   Next bet will be: $${this.currentBetAmount.toFixed(2)}`);
                 }
             } catch (e) {
                 const errorMsg = e instanceof Error ? e.message : String(e);
