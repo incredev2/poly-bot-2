@@ -407,7 +407,7 @@ export class PolymarketBot15Min {
                 const timeLeftSeconds = (end.getTime() - Date.now()) / 1000;
                 
                 // Only check if market has ended (time left <= 1 second)
-                if (timeLeftSeconds > 5) {
+                if (timeLeftSeconds > 1) {
                     continue;
                 }
                 
@@ -463,7 +463,36 @@ export class PolymarketBot15Min {
         }
 
         // Step 3: Check for N consecutive same-color candles and place order to opposite color
+        // Only proceed if we're within 20 seconds of the current market ending
         try {
+            // First, check if we're within 20 seconds of current market ending
+            const { current, next } = await this.findBTC15MinMarkets();
+            
+            if (!current || !next) {
+                console.log(`⏳ Current or next market not available`);
+                return;
+            }
+
+            // Get current market end time
+            const currentDetails = current.markets?.[0] || current;
+            const currentEndDate = currentDetails.endDate || currentDetails.end_date_iso;
+            
+            if (!currentEndDate) {
+                console.log(`⚠️ Could not get end date for current market`);
+                return;
+            }
+
+            const currentEnd = new Date(currentEndDate);
+            const timeLeftSeconds = (currentEnd.getTime() - Date.now()) / 1000;
+
+            // Only proceed if we're within 20 seconds of current market ending
+            if (timeLeftSeconds > 20) {
+                console.log(`⏳ Current market ends in ${timeLeftSeconds.toFixed(1)}s. Waiting until 20 seconds before end.`);
+                return;
+            }
+
+            console.log(`⏰ Current market ends in ${timeLeftSeconds.toFixed(1)}s. Checking candles...`);
+
             const candles = await this.getLastNCandles(this.consecutiveCandlesCount);
             if (!candles || candles.length !== this.consecutiveCandlesCount) {
                 return;
@@ -471,7 +500,7 @@ export class PolymarketBot15Min {
 
             // Determine color of each candle: green/UP if close > open, red/DOWN if close < open
             const candleColors = candles.map(candle => candle.close > candle.open ? "UP" : "DOWN");
-            console.log(44444444444444, candleColors)
+            console.log(`📊 Candle colors:`, candleColors);
             const allSameColor = candleColors.every(color => color === candleColors[0]);
             
             if (allSameColor) {
@@ -484,44 +513,34 @@ export class PolymarketBot15Min {
                     console.log(`✅ ${this.consecutiveCandlesCount} consecutive ${dominantColor} candles detected after win. Ready to place next bet.`);
                 }
 
-                // Place order to opposite color (we only get here if we have N consecutive candles)
-                // If we were waiting, we've now cleared the flag, so proceed with order
-                console.log(`🔄 All ${this.consecutiveCandlesCount} candles are ${dominantColor}, placing order to ${oppositeColor}`);
+                // Place order to opposite color in the NEXT market (we only get here if we have N consecutive candles)
+                console.log(`🔄 All ${this.consecutiveCandlesCount} candles are ${dominantColor}, placing order to ${oppositeColor} in NEXT market`);
                 
-                // Find available market (prefer current, fallback to next)
-                const { current, next } = await this.findBTC15MinMarkets();
-                const market = current || next;
-                console.log({current, next})
-                if (!market) {
-                    console.log(`⏳ No 15-min markets found for placing order`);
+                // Always use next market for placing orders
+                const nextDetails = next.markets?.[0] || next;
+                const nextConditionId = nextDetails.conditionId || next.conditionId;
+
+                if (!nextConditionId) {
+                    console.log(`⚠️ No conditionId found for next market`);
                     return;
                 }
 
-                console.log(`📊 Using ${current ? 'current' : 'next'} market:`, JSON.stringify(market));
-                const details = market.markets?.[0] || market;
-                const conditionId = current?.conditionId;
-
-                if (!conditionId) {
-                    console.log(`⚠️ No conditionId found for market`);
+                // Skip if we already have an order in the next market
+                if (this.trackedMarkets.has(nextConditionId)) {
+                    console.log(`⏸️ Already have order in next market ${nextConditionId.slice(0, 8)}...`);
                     return;
                 }
 
-                // Skip if we already have an order in this market
-                if (this.trackedMarkets.has(conditionId)) {
-                    console.log(`⏸️ Already have order in market ${conditionId.slice(0, 8)}...`);
-                    return;
-                }
-
-                const hasExistingOrder = await this.hasOpenOrderForMarket(conditionId);
+                const hasExistingOrder = await this.hasOpenOrderForMarket(nextConditionId);
                 if (hasExistingOrder) {
-                    console.log(`⏸️ Already have open order in market ${conditionId.slice(0, 8)}...`);
+                    console.log(`⏸️ Already have open order in next market ${nextConditionId.slice(0, 8)}...`);
                     return;
                 }
 
-                // Get prices
-                const prices = await this.getTicketPrices(next!);
+                // Get prices for next market
+                const prices = await this.getTicketPrices(next);
                 if (!prices) {
-                    console.log(`⚠️ Could not get prices for market ${conditionId.slice(0, 8)}`);
+                    console.log(`⚠️ Could not get prices for next market ${nextConditionId.slice(0, 8)}`);
                     return;
                 }
 
@@ -546,33 +565,35 @@ export class PolymarketBot15Min {
 
                 this.orderLock = true;
                 try {
-                    // Final check for existing orders
-                    if (this.trackedMarkets.has(conditionId)) {
-                        console.log(`⏸️ Market ${conditionId.slice(0, 8)} already tracked, skipping`);
+                    // Final check for existing orders in next market
+                    if (this.trackedMarkets.has(nextConditionId)) {
+                        console.log(`⏸️ Next market ${nextConditionId.slice(0, 8)} already tracked, skipping`);
                         return;
                     }
 
-                    const hasExistingOrderNow = await this.hasOpenOrderForMarket(conditionId);
+                    const hasExistingOrderNow = await this.hasOpenOrderForMarket(nextConditionId);
                     if (hasExistingOrderNow) {
-                        console.log(`⏸️ Order already exists in market ${conditionId.slice(0, 8)}...`);
+                        console.log(`⏸️ Order already exists in next market ${nextConditionId.slice(0, 8)}...`);
                         return;
                     }
 
-                    // Mark market as tracked
-                    this.trackedMarkets.set(conditionId, {
-                        conditionId,
+                    // Mark next market as tracked
+                    this.trackedMarkets.set(nextConditionId, {
+                        conditionId: nextConditionId,
                         side
                     });
 
-                    // Place order with current bet amount
-                    console.log(`💰 Placing ${side} order with bet amount: $${this.currentBetAmount}`);
-                    const orderResult = await this.placeOrder(next?.conditionId!, tokenId, bidPrice, side);
+                    // Place order in next market with current bet amount
+                    console.log(`💰 Placing ${side} order in NEXT market with bet amount: $${this.currentBetAmount}`);
+                    const orderResult = await this.placeOrder(nextConditionId, tokenId, bidPrice, side);
 
                     if (!orderResult?.orderID) {
-                        this.trackedMarkets.delete(conditionId);
-                        console.log(`⚠️ Order failed, removed from tracking`);
+                        // Order API call failed - just remove from tracking (don't double bet)
+                        // Bet doubling only happens when we actually lose a bet (handled in Step 1)
+                        this.trackedMarkets.delete(nextConditionId);
+                        console.log(`⚠️ Order API call failed, removed from tracking. Bet amount unchanged: $${this.currentBetAmount}`);
                     } else {
-                        console.log(`✅ Order placed successfully: ${side} at ${(bidPrice * 100).toFixed(1)}¢ with $${this.currentBetAmount}`);
+                        console.log(`✅ Order placed successfully in NEXT market: ${side} at ${(bidPrice * 100).toFixed(1)}¢ with $${this.currentBetAmount}`);
                     }
                 } finally {
                     this.orderLock = false;
