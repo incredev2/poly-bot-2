@@ -461,9 +461,9 @@ export class PolymarketBot15Min {
                 // - If we bet DOWN: win if DOWN price >= 99¢
                 let weWon: boolean;
                 if (marketInfo.side === "UP") {
-                    weWon = upPrice >= 0.99;
+                    weWon = upPrice >= 0.95;
                 } else {
-                    weWon = downPrice >= 0.99;
+                    weWon = downPrice >= 0.95;
                 }
 
                 console.log(`📊 Market ${marketInfo.conditionId.slice(0, 8)} ended:`);
