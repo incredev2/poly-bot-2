@@ -433,7 +433,7 @@ export class PolymarketBot15Min {
                 
                 // Check if market has ended: either closed or time left <= 1 second
                 const isClosed = details.closed || marketDetails.closed;
-                const hasEnded = isClosed || timeLeftSeconds <= 2;
+                const hasEnded = isClosed || timeLeftSeconds <= 5;
                 
                 if (!hasEnded) {
                     continue;
@@ -520,7 +520,7 @@ export class PolymarketBot15Min {
             const timeLeftSeconds = (currentEnd.getTime() - Date.now()) / 1000;
 
             // Only proceed if we're within 20 seconds of current market ending
-            if (timeLeftSeconds > 2) {
+            if (timeLeftSeconds > 5) {
                 console.log(`⏳ Current market ends in ${timeLeftSeconds.toFixed(1)}s. Waiting until 2 seconds before end.`);
                 return;
             }
