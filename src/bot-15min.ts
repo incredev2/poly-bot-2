@@ -302,7 +302,7 @@ export class PolymarketBot15Min {
             const tickSize = tickSizeMap[market.minimum_tick_size] || "0.01";
             
             // Ensure price is a valid number
-            const price = 0.48;
+            const price = Number(bidPrice)
             if (isNaN(price) || price <= 0) {
                 console.error(`❌ Invalid price: ${bidPrice}`);
                 return null;
